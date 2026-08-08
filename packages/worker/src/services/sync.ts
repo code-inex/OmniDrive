@@ -91,8 +91,9 @@ async function performInitialSync(
 ): Promise<boolean> {
   console.log(`Initial sync for ${drive.email} — chunk processing`);
 
-  const rootFolderId = await driveService.getRootFolderId(drive.id);
-  const iterator = driveService.iterateAllFilesAndFolders(drive.id, startPageToken);
+  // For service accounts with a specific root folder, use that; otherwise fetch the drive's root
+  const rootFolderId = drive.rootFolderId || await driveService.getRootFolderId(drive.id);
+  const iterator = driveService.iterateAllFilesAndFolders(drive.id, startPageToken, drive.rootFolderId || undefined);
 
   for await (const chunk of iterator) {
     if (getIsShuttingDown()) {
@@ -129,7 +130,7 @@ async function performIncrementalSync(
 ): Promise<string> {
   console.log(`Incremental sync for ${drive.email} from token ${pageToken}`);
 
-  const rootFolderId = await driveService.getRootFolderId(drive.id);
+  const rootFolderId = drive.rootFolderId || await driveService.getRootFolderId(drive.id);
 
   let currentToken = pageToken;
   let hasMore = true;
@@ -257,7 +258,7 @@ export async function runScheduledSync(env: {
 
   const driveService = new GoogleDriveService(env.KV, env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET, env.TOKEN_ENCRYPTION_KEY);
 
-  const rows = await env.DB.prepare("SELECT * FROM drive_accounts WHERE type = 'oauth'").all();
+  const rows = await env.DB.prepare("SELECT * FROM drive_accounts").all();
   const driveAccounts = (rows.results ?? []).map(mapDriveRow);
 
   console.log(`Syncing ${driveAccounts.length} drive accounts`);

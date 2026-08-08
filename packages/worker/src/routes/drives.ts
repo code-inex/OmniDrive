@@ -98,6 +98,12 @@ drivesRouter.get('/', async (c) => {
       
       const quota = await driveService.getQuota(drive.id);
 
+      // Service accounts typically return 0 quota (no personal storage)
+      // In that case, try to get shared drive storage or mark as unlimited
+      if (quota.total === 0 && drive.type === 'service_account') {
+        return { ...drive, totalQuota: -1, usedQuota: quota.used, freeSpace: -1, usagePercent: 0 };
+      }
+
       const freeSpace = quota.total - quota.used;
       const usagePercent = quota.total > 0 ? (quota.used / quota.total) * 100 : 0;
 
@@ -117,9 +123,9 @@ drivesRouter.get('/', async (c) => {
   }));
 
   const aggregate = {
-    totalQuota: drivesWithQuota.reduce((sum, d) => sum + d.totalQuota, 0),
-    totalUsed: drivesWithQuota.reduce((sum, d) => sum + d.usedQuota, 0),
-    totalFree: drivesWithQuota.reduce((sum, d) => sum + d.freeSpace, 0),
+    totalQuota: drivesWithQuota.reduce((sum, d) => sum + Math.max(0, d.totalQuota), 0),
+    totalUsed: drivesWithQuota.reduce((sum, d) => sum + Math.max(0, d.usedQuota), 0),
+    totalFree: drivesWithQuota.reduce((sum, d) => sum + Math.max(0, d.freeSpace), 0),
     driveCount: drivesWithQuota.length,
   };
 
@@ -328,6 +334,151 @@ drivesRouter.post('/:driveId/folders/:googleFolderId/sync', async (c) => {
     files: newFiles.results.map(r => mapFileRow(r as Record<string, unknown>)),
     breadcrumb,
   });
+});
+
+
+// ─── Add drive via Service Account JSON ───
+
+drivesRouter.post('/service-account', async (c) => {
+  const userId = c.get('userId');
+  const body = await c.req.json<{ credentials: string; folderId?: string }>();
+
+  if (!body.credentials) {
+    throw new AppError(400, 'Service account credentials JSON is required');
+  }
+
+  let saKey: {
+    type: string;
+    project_id: string;
+    private_key_id: string;
+    private_key: string;
+    client_email: string;
+    client_id: string;
+    token_uri: string;
+  };
+
+  try {
+    saKey = JSON.parse(body.credentials);
+  } catch {
+    throw new AppError(400, 'Invalid JSON format for service account credentials');
+  }
+
+  if (saKey.type !== 'service_account') {
+    throw new AppError(400, 'Invalid credentials: must be a service_account type');
+  }
+
+  if (!saKey.private_key || !saKey.client_email) {
+    throw new AppError(400, 'Invalid credentials: missing private_key or client_email');
+  }
+
+  // Generate a JWT and exchange for an access token
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const payload = {
+    iss: saKey.client_email,
+    scope: 'https://www.googleapis.com/auth/drive',
+    aud: saKey.token_uri || 'https://oauth2.googleapis.com/token',
+    iat: now,
+    exp: now + 3600,
+  };
+
+  const toBase64Url = (obj: unknown) =>
+    btoa(JSON.stringify(obj)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  const unsignedToken = `${toBase64Url(header)}.${toBase64Url(payload)}`;
+
+  // Import the RSA private key
+  const pemContents = saKey.private_key
+    .replace(/-----BEGIN PRIVATE KEY-----/, '')
+    .replace(/-----END PRIVATE KEY-----/, '')
+    .replace(/\n/g, '');
+  const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
+
+  const cryptoKey = await crypto.subtle.importKey(
+    'pkcs8',
+    binaryDer,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  const signatureBuffer = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    cryptoKey,
+    new TextEncoder().encode(unsignedToken)
+  );
+
+  const signature = btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+
+  const jwt = `${unsignedToken}.${signature}`;
+
+  // Exchange JWT for access token
+  const tokenRes = await fetch(saKey.token_uri || 'https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: jwt,
+    }),
+  });
+
+  if (!tokenRes.ok) {
+    const errData = await tokenRes.text();
+    console.error('Service account token exchange failed:', errData);
+    throw new AppError(400, 'Failed to authenticate service account. Check your credentials.');
+  }
+
+  const tokenData = await tokenRes.json<{ access_token: string; expires_in: number }>();
+
+  // Store tokens in KV (encrypted)
+  const driveId = generateId();
+  const tokens = {
+    accessToken: tokenData.access_token,
+    refreshToken: '', // SA uses JWT, no refresh token
+    expiresAt: Date.now() + tokenData.expires_in * 1000,
+    saCredentials: body.credentials, // Store SA JSON for re-generating tokens
+  };
+
+  const { encrypt: encryptFn } = await import('../lib/crypto');
+  const encryptedTokens = await encryptFn(JSON.stringify(tokens), c.env.TOKEN_ENCRYPTION_KEY);
+  await c.env.KV.put(`tokens:${driveId}`, encryptedTokens);
+
+  // Verify access by calling Drive API
+  const aboutRes = await fetch('https://www.googleapis.com/drive/v3/about?fields=user,storageQuota', {
+    headers: { Authorization: `Bearer ${tokenData.access_token}` },
+  });
+
+  if (!aboutRes.ok) {
+    throw new AppError(400, 'Failed to access Google Drive with this service account');
+  }
+
+  const about = await aboutRes.json<{
+    user: { emailAddress: string; displayName: string };
+    storageQuota: { limit?: string; usage: string };
+  }>();
+
+  // Insert drive account record
+  await c.env.DB
+    .prepare(
+      `INSERT INTO drive_accounts (id, user_id, google_account_id, email, name, type, root_folder_id, total_quota, used_quota, quota_updated_at)
+       VALUES (?, ?, ?, ?, ?, 'service_account', ?, ?, ?, CURRENT_TIMESTAMP)`
+    )
+    .bind(
+      driveId,
+      userId,
+      saKey.client_id || saKey.client_email,
+      saKey.client_email,
+      about.user?.displayName || saKey.client_email,
+      body.folderId || null,
+      parseInt(about.storageQuota?.limit || '0', 10),
+      parseInt(about.storageQuota?.usage || '0', 10)
+    )
+    .run();
+
+  return c.json({ success: true, driveId });
 });
 
 drivesRouter.delete('/:id', async (c) => {
