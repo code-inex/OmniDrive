@@ -62,15 +62,98 @@ export class GoogleDriveService {
       }
     }
 
-    const tokens: OAuthTokens = JSON.parse(tokensJson);
+    const tokens = JSON.parse(tokensJson);
 
     // Return cached token if not expired (with 60s buffer)
     if (tokens.expiresAt > Date.now() + 60_000) {
       return tokens.accessToken;
     }
 
-    // Refresh the token
+    // Service account: re-sign JWT using stored credentials
+    if (tokens.saCredentials) {
+      return this.refreshServiceAccountToken(driveAccountId, tokens.saCredentials);
+    }
+
+    // OAuth: use refresh token
     return this.refreshToken(driveAccountId, tokens.refreshToken);
+  }
+
+  private async refreshServiceAccountToken(driveAccountId: string, saCredentialsJson: string): Promise<string> {
+    const saKey = JSON.parse(saCredentialsJson);
+    const now = Math.floor(Date.now() / 1000);
+    const header = { alg: 'RS256', typ: 'JWT' };
+    const payload = {
+      iss: saKey.client_email,
+      scope: 'https://www.googleapis.com/auth/drive',
+      aud: saKey.token_uri || 'https://oauth2.googleapis.com/token',
+      iat: now,
+      exp: now + 3600,
+    };
+
+    const toBase64Url = (obj: unknown) =>
+      btoa(JSON.stringify(obj)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    const unsignedToken = `${toBase64Url(header)}.${toBase64Url(payload)}`;
+
+    const pemContents = saKey.private_key
+      .replace(/-----BEGIN PRIVATE KEY-----/, '')
+      .replace(/-----END PRIVATE KEY-----/, '')
+      .replace(/\n/g, '');
+    const binaryDer = Uint8Array.from(atob(pemContents), (c: string) => c.charCodeAt(0));
+
+    const cryptoKey = await crypto.subtle.importKey(
+      'pkcs8',
+      binaryDer,
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+
+    const signatureBuffer = await crypto.subtle.sign(
+      'RSASSA-PKCS1-v1_5',
+      cryptoKey,
+      new TextEncoder().encode(unsignedToken)
+    );
+
+    const signature = btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    const jwt = `${unsignedToken}.${signature}`;
+
+    const tokenRes = await fetch(saKey.token_uri || 'https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion: jwt,
+      }),
+    });
+
+    if (!tokenRes.ok) {
+      throw new Error(`Service account token refresh failed: ${await tokenRes.text()}`);
+    }
+
+    const data: { access_token: string; expires_in: number } = await tokenRes.json();
+
+    // Update KV with new access token
+    const newTokens = JSON.stringify({
+      accessToken: data.access_token,
+      refreshToken: '',
+      expiresAt: Date.now() + data.expires_in * 1000,
+      saCredentials: saCredentialsJson,
+    });
+
+    if (this.encryptionKey) {
+      const { encrypt } = await import('../lib/crypto');
+      const encrypted = await encrypt(newTokens, this.encryptionKey);
+      await this.kv.put(`tokens:${driveAccountId}`, encrypted);
+    } else {
+      await this.kv.put(`tokens:${driveAccountId}`, newTokens);
+    }
+
+    return data.access_token;
   }
 
   private async refreshToken(driveAccountId: string, refreshToken: string): Promise<string> {
@@ -609,41 +692,93 @@ export class GoogleDriveService {
 
   async *iterateAllFilesAndFolders(
     driveAccountId: string,
-    startPageToken?: string
+    startPageToken?: string,
+    parentFolderId?: string
   ): AsyncGenerator<{ files: GDriveFile[]; folders: GDriveFolder[]; nextPageToken?: string }, void, unknown> {
     const token = await this.getValidToken(driveAccountId);
     const fields =
       'nextPageToken,files(id,name,mimeType,size,parents,trashed,thumbnailLink,webViewLink,webContentLink,createdTime,modifiedTime,md5Checksum)';
-    const q = encodeURIComponent(`trashed = false`);
+    
+    // If a specific parent folder is given (e.g. service account root), scope the query
+    const qParts = ['trashed = false'];
+    if (parentFolderId) {
+      qParts.push(`'${parentFolderId}' in parents`);
+    }
+    const q = encodeURIComponent(qParts.join(' and '));
 
     let pageToken: string | undefined = startPageToken;
 
-    do {
-      const url = `${DRIVE_API}/files?q=${q}&fields=${fields}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
-      const response = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+    // For service accounts with a specific folder, we need to recursively fetch subfolders
+    const foldersToProcess: string[] = parentFolderId ? [parentFolderId] : [];
+    const processedFolders = new Set<string>();
 
-      if (!response.ok) {
-        throw new Error(`Failed to list folder contents: ${await response.text()}`);
+    if (parentFolderId) {
+      // BFS approach: process folder by folder
+      while (foldersToProcess.length > 0) {
+        const currentFolder = foldersToProcess.shift()!;
+        if (processedFolders.has(currentFolder)) continue;
+        processedFolders.add(currentFolder);
+
+        const folderQ = encodeURIComponent(`trashed = false and '${currentFolder}' in parents`);
+        let folderPageToken: string | undefined;
+
+        do {
+          const url = `${DRIVE_API}/files?q=${folderQ}&fields=${fields}&pageSize=1000${folderPageToken ? `&pageToken=${encodeURIComponent(folderPageToken)}` : ''}`;
+          const response = await fetch(url, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+
+          if (!response.ok) {
+            throw new Error(`Failed to list folder contents: ${await response.text()}`);
+          }
+
+          const data: { files: GDriveFile[]; nextPageToken?: string } = await response.json();
+
+          const chunkFiles: GDriveFile[] = [];
+          const chunkFolders: GDriveFolder[] = [];
+
+          for (const item of data.files) {
+            if (item.mimeType === 'application/vnd.google-apps.folder') {
+              chunkFolders.push({ id: item.id, name: item.name, parents: item.parents });
+              foldersToProcess.push(item.id);
+            } else if (item.mimeType !== 'application/vnd.google-apps.shortcut') {
+              chunkFiles.push(item);
+            }
+          }
+
+          yield { files: chunkFiles, folders: chunkFolders, nextPageToken: data.nextPageToken };
+          folderPageToken = data.nextPageToken;
+        } while (folderPageToken);
       }
+    } else {
+      // Original behavior: list all files across the entire drive
+      do {
+        const url = `${DRIVE_API}/files?q=${q}&fields=${fields}&pageSize=1000${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
+        const response = await fetch(url, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
 
-      const data: { files: GDriveFile[]; nextPageToken?: string } = await response.json();
-
-      const chunkFiles: GDriveFile[] = [];
-      const chunkFolders: GDriveFolder[] = [];
-
-      for (const item of data.files) {
-        if (item.mimeType === 'application/vnd.google-apps.folder') {
-          chunkFolders.push({ id: item.id, name: item.name, parents: item.parents });
-        } else if (item.mimeType !== 'application/vnd.google-apps.shortcut') {
-          chunkFiles.push(item);
+        if (!response.ok) {
+          throw new Error(`Failed to list folder contents: ${await response.text()}`);
         }
-      }
 
-      yield { files: chunkFiles, folders: chunkFolders, nextPageToken: data.nextPageToken };
-      
-      pageToken = data.nextPageToken;
-    } while (pageToken);
+        const data: { files: GDriveFile[]; nextPageToken?: string } = await response.json();
+
+        const chunkFiles: GDriveFile[] = [];
+        const chunkFolders: GDriveFolder[] = [];
+
+        for (const item of data.files) {
+          if (item.mimeType === 'application/vnd.google-apps.folder') {
+            chunkFolders.push({ id: item.id, name: item.name, parents: item.parents });
+          } else if (item.mimeType !== 'application/vnd.google-apps.shortcut') {
+            chunkFiles.push(item);
+          }
+        }
+
+        yield { files: chunkFiles, folders: chunkFolders, nextPageToken: data.nextPageToken };
+        
+        pageToken = data.nextPageToken;
+      } while (pageToken);
+    }
   }
 }

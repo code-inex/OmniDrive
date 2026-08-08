@@ -62,14 +62,23 @@ export function DashboardPage() {
               {aggregate.driveCount} drive{aggregate.driveCount > 1 ? 's' : ''} connected
             </span>
           </div>
-          <QuotaBar used={aggregate.totalUsed} total={aggregate.totalQuota} />
-          <div className="flex gap-4 mt-3 text-sm text-gray-500">
-            <span className="text-blue-700 font-medium">{formatFileSize(aggregate.totalUsed)} used</span>
-            <span>·</span>
-            <span>{formatFileSize(aggregate.totalFree)} free</span>
-            <span>·</span>
-            <span>{formatFileSize(aggregate.totalQuota)} total</span>
-          </div>
+          {aggregate.totalQuota > 0 ? (
+            <>
+              <QuotaBar used={aggregate.totalUsed} total={aggregate.totalQuota} />
+              <div className="flex gap-4 mt-3 text-sm text-gray-500">
+                <span className="text-blue-700 font-medium">{formatFileSize(aggregate.totalUsed)} used</span>
+                <span>·</span>
+                <span>{formatFileSize(aggregate.totalFree)} free</span>
+                <span>·</span>
+                <span>{formatFileSize(aggregate.totalQuota)} total</span>
+              </div>
+            </>
+          ) : (
+            <div className="text-sm text-gray-500">
+              <span className="text-blue-700 font-medium">{formatFileSize(aggregate.totalUsed)} used</span>
+              <span className="ml-2">· Shared Drive (Unlimited)</span>
+            </div>
+          )}
         </div>
       )}
 

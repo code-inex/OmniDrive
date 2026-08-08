@@ -70,11 +70,19 @@ export function DriveAccountCard({ drive, index, onSync, onDisconnect }: DriveAc
         </div>
       </div>
 
-      <QuotaBar used={drive.usedQuota} total={drive.totalQuota} color={color} showLabel={false} />
-      <div className="flex justify-between mt-2 text-xs text-gray-400">
-        <span>{formatFileSize(drive.freeSpace)} free of {formatFileSize(drive.totalQuota)}</span>
-        <span>{drive.usagePercent}%</span>
-      </div>
+      {drive.totalQuota > 0 ? (
+        <>
+          <QuotaBar used={drive.usedQuota} total={drive.totalQuota} color={color} showLabel={false} />
+          <div className="flex justify-between mt-2 text-xs text-gray-400">
+            <span>{formatFileSize(drive.freeSpace)} free of {formatFileSize(drive.totalQuota)}</span>
+            <span>{drive.usagePercent}%</span>
+          </div>
+        </>
+      ) : (
+        <div className="mt-2 text-xs text-gray-400">
+          {drive.type === 'service_account' ? 'Shared Drive · Unlimited' : 'Quota unavailable'}
+        </div>
+      )}
     </div>
   );
 }
